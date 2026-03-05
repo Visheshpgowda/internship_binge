@@ -1,0 +1,12 @@
+.env
+credentials.json
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.vscode/
+.idea/
+processed_submissions.json
