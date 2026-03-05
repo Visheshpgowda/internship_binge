@@ -1,13 +1,14 @@
 import os
 import json
+import time
 import smtplib
 from email.mime.text import MIMEText
-
-from flask import Flask, request, jsonify
-
 from dotenv import load_dotenv
 from openai import OpenAI
 from notion_client import Client
+
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
 
 # ==============================
 # ENV SETUP
@@ -15,10 +16,11 @@ from notion_client import Client
 
 load_dotenv()
 
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-notion = Client(auth=os.getenv("NOTION_API_KEY"))
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+NOTION_API_KEY = os.getenv("NOTION_API_KEY")
 
-app = Flask(__name__)
+EMAIL_ADDRESS = os.getenv("EMAIL_ADDRESS")
+EMAIL_APP_PASSWORD = os.getenv("EMAIL_APP_PASSWORD")
 
 # ==============================
 # CONFIG
@@ -26,84 +28,114 @@ app = Flask(__name__)
 
 NOTION_DATABASE_ID = "31938c324c0a804eaac7caf3fbdd304f"
 
-EMAIL_ADDRESS = "visheshtechie15@gmail.com"
-EMAIL_APP_PASSWORD = "fldc gipu mkgd kcxq"
+SPREADSHEET_ID = "1bUMlFolCpSJbSraLDE8ZkiNRhHhufGwN_FF2Fa7I0ZU"
+RANGE_NAME = "Form Responses 1"
+
+SERVICE_ACCOUNT_FILE = "credentials.json"
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets.readonly"]
+
+CHECK_INTERVAL = 60
+
+PROCESSED_FILE = "processed_submissions.json"
+
+# ==============================
+# CLIENTS
+# ==============================
+
+openai_client = OpenAI(api_key=OPENAI_API_KEY)
+notion = Client(auth=NOTION_API_KEY)
+
+# ==============================
+# UTILITIES
+# ==============================
+
+def log(msg):
+    print(f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+
+def load_processed():
+    if os.path.exists(PROCESSED_FILE):
+        with open(PROCESSED_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+def save_processed(data):
+    with open(PROCESSED_FILE, "w") as f:
+        json.dump(list(data), f)
+
+# ==============================
+# GOOGLE SHEETS
+# ==============================
+
+def fetch_rows():
+
+    creds = service_account.Credentials.from_service_account_file(
+        SERVICE_ACCOUNT_FILE,
+        scopes=SCOPES
+    )
+
+    service = build("sheets", "v4", credentials=creds)
+
+    result = service.spreadsheets().values().get(
+        spreadsheetId=SPREADSHEET_ID,
+        range=RANGE_NAME
+    ).execute()
+
+    rows = result.get("values", [])
+
+    return rows
 
 # ==============================
 # AI GENERATION
 # ==============================
 
-def generate_brief_and_script(form_data):
+def generate_script(data):
 
-    print("🤖 Generating script with AI...")
+    log("🤖 Generating script with AI")
 
     prompt = f"""
-You are Scrollhouse's internal creative strategist.
+You are Scrollhouse's creative strategist.
 
 Generate a short-form video script.
 
-Return STRICT JSON only.
-
-{{
-  "internal_brief": {{
-      "brand_name": "",
-      "target_audience": "",
-      "platform": "",
-      "campaign_objective": "",
-      "key_message": "",
-      "tone_of_voice": "",
-      "call_to_action": "",
-      "constraints": ""
-  }},
-  "script_draft": "Hook, main script, CTA",
-  "quality_notes": ""
-}}
-
-Client Submission:
-
-Brand Name: {form_data['brand']}
-Target Audience: {form_data['audience']}
-Platform: {form_data['platform']}
-Campaign Objective: {form_data['objective']}
-Key Message: {form_data.get('message','')}
-Tone of Voice: {form_data['tone']}
-Call To Action: {form_data['cta']}
-Constraints: {form_data.get('constraints','')}
+Brand: {data['brand']}
+Target Audience: {data['audience']}
+Platform: {data['platform']}
+Campaign Objective: {data['objective']}
+Key Message: {data['message']}
+Tone: {data['tone']}
+Call To Action: {data['cta']}
 """
 
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7
+        messages=[{"role": "user", "content": prompt}]
     )
 
-    ai_output = response.choices[0].message.content
+    script = response.choices[0].message.content
 
-    print("🧠 AI response:", ai_output)
-
-    return json.loads(ai_output)
+    return script
 
 # ==============================
-# NOTION PAGE
+# NOTION
 # ==============================
 
-def create_notion_page(result):
+def create_notion_page(brand, platform, objective, audience, script):
 
-    print("📝 Creating Notion page...")
+    log("📝 Creating Notion page")
 
     page = notion.pages.create(
         parent={"database_id": NOTION_DATABASE_ID},
         properties={
-
             "Brand": {
                 "title": [
-                    {"text": {"content": result["internal_brief"]["brand_name"]}}
+                    {"text": {"content": brand}}
                 ]
             },
 
             "Platform": {
                 "select": {
-                    "name": result["internal_brief"]["platform"]
+                    "name": platform
                 }
             },
 
@@ -115,41 +147,44 @@ def create_notion_page(result):
 
             "Campaign Objective": {
                 "rich_text": [
-                    {"text": {"content": result["internal_brief"]["campaign_objective"]}}
+                    {"text": {"content": objective}}
                 ]
             },
 
             "Target Audience": {
                 "rich_text": [
-                    {"text": {"content": result["internal_brief"]["target_audience"]}}
+                    {"text": {"content": audience}}
                 ]
             },
 
             "Script": {
                 "rich_text": [
-                    {"text": {"content": result["script_draft"]}}
+                    {"text": {"content": script}}
                 ]
             }
-
         }
     )
 
     page_url = page["url"]
 
-    print("✅ Notion page created:", page_url)
+    log(f"✅ Notion page created: {page_url}")
 
     return page_url
 
 # ==============================
-# EMAIL SENDING
+# EMAIL
 # ==============================
 
 def send_email(brand, script, notion_link):
 
-    print("📧 Sending email...")
+    if not EMAIL_ADDRESS:
+        log("⚠️ Email disabled (no credentials)")
+        return
+
+    log("📧 Sending email")
 
     body = f"""
-New Script Draft Ready 🚀
+New Script Generated 🚀
 
 Brand: {brand}
 
@@ -162,52 +197,118 @@ View in Notion:
 
     msg = MIMEText(body)
 
-    msg["Subject"] = f"New Script Ready - {brand}"
+    msg["Subject"] = f"Script Ready - {brand}"
     msg["From"] = EMAIL_ADDRESS
     msg["To"] = EMAIL_ADDRESS
 
-    server = smtplib.SMTP("smtp.gmail.com", 587)
+    try:
 
-    server.starttls()
+        server = smtplib.SMTP("smtp.gmail.com", 587, timeout=10)
+        server.starttls()
 
-    server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
 
-    server.send_message(msg)
+        server.send_message(msg)
 
-    server.quit()
+        server.quit()
 
-    print("✅ Email sent")
+        log("✅ Email sent")
+
+    except Exception as e:
+
+        log(f"⚠️ Email failed: {e}")
 
 # ==============================
-# WEBHOOK ENDPOINT
+# PROCESS ROW
 # ==============================
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
+def process_submission(row):
 
-    form_data = request.json
+    # Pad row if missing columns
+    while len(row) < 8:
+        row.append("")
 
-    print("\n📩 Webhook triggered with data:", form_data)
+    timestamp = row[0]
+    brand = row[1]
+    audience = row[2]
+    platform = row[3]
+    objective = row[4]
+    message = row[5]
+    tone = row[6]
+    cta = row[7]
 
-    result = generate_brief_and_script(form_data)
+    log(f"Processing submission for brand: {brand}")
 
-    notion_link = create_notion_page(result)
+    data = {
+        "brand": brand,
+        "audience": audience,
+        "platform": platform,
+        "objective": objective,
+        "message": message,
+        "tone": tone,
+        "cta": cta
+    }
 
-    send_email(
-        result["internal_brief"]["brand_name"],
-        result["script_draft"],
-        notion_link
+    script = generate_script(data)
+
+    notion_link = create_notion_page(
+        brand,
+        platform,
+        objective,
+        audience,
+        script
     )
 
-    return jsonify({"status": "success"})
-
+    send_email(brand, script, notion_link)
 
 # ==============================
-# START SERVER
+# MAIN LOOP
+# ==============================
+
+def main():
+
+    log("🚀 Scrollhouse AI Polling Agent Started")
+
+    processed = load_processed()
+
+    while True:
+
+        try:
+
+            rows = fetch_rows()
+
+            if not rows:
+                log("No data in sheet")
+
+            for row in rows[1:]:  # skip header
+
+                # ensure timestamp exists
+                if not row:
+                    continue
+
+                timestamp = row[0]
+
+                if timestamp not in processed:
+
+                    log(f"🆕 New submission detected: {timestamp}")
+
+                    process_submission(row)
+
+                    processed.add(timestamp)
+
+                    save_processed(processed)
+
+        except Exception as e:
+
+            log(f"❌ Error: {e}")
+
+        log(f"Sleeping {CHECK_INTERVAL} seconds...\n")
+
+        time.sleep(CHECK_INTERVAL)
+
+# ==============================
+# START
 # ==============================
 
 if __name__ == "__main__":
-
-    print("\n🚀 Scrollhouse AI Agent Server Running\n")
-
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    main()
