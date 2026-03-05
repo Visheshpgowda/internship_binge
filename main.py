@@ -423,6 +423,17 @@ if __name__ == "__main__":
             log(f"📊 Sheet: {total} row(s) | {skipped} already done | {len(new_subs)} new")
 
             for sub in new_subs:
+                # Skip rows with no timestamp (manually inserted sheet rows, not Form submissions)
+                if not sub["timestamp"].strip():
+                    log(f"⚠️  Skipping row with empty timestamp (brand: '{sub['brand']}') — not a Form submission")
+                    continue
+
+                # Re-check state here in case two rows share the same timestamp
+                # (e.g. duplicate manual entries added to the sheet)
+                if already_processed(state, sub["timestamp"]):
+                    log(f"⏭️  Already processed this cycle: [{sub['timestamp']}] — skipping duplicate")
+                    continue
+
                 process_submission(sub, state)
 
         except Exception as e:
